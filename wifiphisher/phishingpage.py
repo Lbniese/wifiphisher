@@ -6,6 +6,29 @@ Wifiphisher.py
 import os
 from constants import *
 
+import ConfigParser
+from jinja2 import Environment, FileSystemLoader
+
+def config_section_map(config_file, section):
+    """
+    Map the values of a config file to a dictionary.
+    """
+
+    config = ConfigParser.ConfigParser()
+    config.read(config_file)
+    dict1 = {}
+
+    if section not in config.sections():
+        return dict1
+
+    options = config.options(section)
+    for option in options:
+        try:
+            dict1[option] = config.get(section, option)
+        except:
+            print("exception on %s!" % option)
+            dict1[option] = None
+    return dict1
 
 class InvalidTemplate(Exception):
     """ Exception class to raise in case of a invalid template """
@@ -18,26 +41,37 @@ class InvalidTemplate(Exception):
 class PhishingTemplate(object):
     """ This class represents phishing templates """
 
-    def __init__(self, name, display_name="", description=""):
+    def __init__(self, name):
         """
         Construct object.
 
         :param self: A PhishingTemplate object
-        :param name: The name of the template
-        :param description: The description of the template
         :type self: PhishingScenario
-        :type name: str
-        :type description: str
         :return: None
         :rtype: None
         .. todo:: Maybe add a category field
         """
 
         # setup all the variables
+
+        config_path = os.path.join(PHISHING_PAGES_DIR, name, 'config.ini')
+        info = config_section_map(config_path, 'info')
+
         self._name = name
-        self._display_name = display_name
-        self._description = description
+        self._display_name = info['name']
+        self._description = info['description']
         self._path = PHISHING_PAGES_DIR + self._name.lower()
+
+        self._context = config_section_map(config_path, 'context')
+        self._env = Environment(loader=FileSystemLoader(self._path))
+
+    def merge_context(self, context):
+        """
+            Merge dict context with current one
+            In case of confict always keep current values
+        """
+        context.update(self._context)
+        self._context = context
 
     def get_display_name(self):
         """
@@ -75,6 +109,10 @@ class PhishingTemplate(object):
 
         return self._path
 
+    def render(self, path):
+        t = self._env.get_template(path)
+        return t.render(self._context)
+
     def __str__(self):
         """
         Return a string representation of the template.
@@ -104,33 +142,12 @@ class TemplateManager(object):
         # setup the templates
         self._template_directory = PHISHING_PAGES_DIR
 
-        # Firmware Upgrade
-        display_name = "Firmware Upgrade Page"
-        description = ("A router configuration page without logos or " +
-                       "brands asking for WPA/WPA2 password due to a " +
-                       "firmware upgrade. Mobile-friendly.")
-        firmware_upgrade = PhishingTemplate("firmware-upgrade", display_name,
-                                            description)
+        page_dirs = os.listdir(PHISHING_PAGES_DIR)
 
-        # Connection Reset
-        display_name = "Browser Connection Reset"
-        description = ("Browser message asking for WPA/WPA2 password " +
-                       "due to a connection reset. Style changes according " +
-                       "the user-agent header. Mobile-friendly.")
-        connection = PhishingTemplate("connection_reset", display_name,
-                                      description)
+        self._templates = {}
 
-        # Browser Plugin Update
-        display_name = "Browser Plugin Update"
-        description = ("A generic browser plugin update template that " +
-                       "can be used to serve payloads to Windows targets. " +
-                       "Mobile-friendly.")
-        plugin_update = PhishingTemplate("plugin_update",
-                                         display_name, description)
-
-        self._templates = {"connection_reset": connection,
-                           "firmware-upgrade": firmware_upgrade,
-                           "plugin_update": plugin_update}
+        for page in page_dirs:
+            self._templates[page] = PhishingTemplate(page)
 
         # add all the user templates to the database
         self.add_user_templates()
